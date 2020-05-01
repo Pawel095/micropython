@@ -1,19 +1,25 @@
 """
 Tiny Web - pretty simple and powerful web server for tiny platforms like ESP8266 / ESP32
 MIT license
-(C) Konstantin Belyalov 2017-2018
+(C) Konstantin Belyalov 2017-2020
 """
-import logging
-import uasyncio as asyncio
-import ujson as json
+import uasyncio
+import json
 import gc
-import uos as os
+import os
 import sys
-import uerrno as errno
-import usocket as socket
+import errno
+import socket
 
 
-log = logging.getLogger('WEB')
+def default_log_error(e):
+    print("ERROR: {}".format(e))
+
+
+log_error = default_log_error
+
+
+type_gen = type((lambda: (yield))())
 
 
 def urldecode_plus(s):
@@ -323,7 +329,7 @@ async def restful_resource_handler(req, resp, param=None):
     # it can also return error code together with str / dict
     # res = {'blah': 'blah'}
     # res = {'blah': 'blah'}, 201
-    if isinstance(res, asyncio.type_gen):
+    if isinstance(res, type_gen):
         # Result is generator, use chunked response
         # NOTICE: HTTP 1.0 by itself does not support chunked responses, so, making workaround:
         # Response is HTTP/1.1 with Connection: close
@@ -361,7 +367,7 @@ async def restful_resource_handler(req, resp, param=None):
 
 class webserver:
 
-    def __init__(self, request_timeout=3, max_concurrency=3, backlog=16, debug=False):
+    def __init__(self, host="127.0.0.1", port=8081, request_timeout=3, max_concurrency=3, backlog=16, debug=False):
         """Tiny Web Server class.
         Keyword arguments:
             request_timeout - Time for client to send complete request
@@ -376,17 +382,27 @@ class webserver:
             debug           - Whether send exception info (text + backtrace)
                               to client together with HTTP 500 or not.
         """
-        self.loop = asyncio.get_event_loop()
+        self.host = host
+        self.port = port
         self.request_timeout = request_timeout
         self.max_concurrency = max_concurrency
         self.backlog = backlog
         self.debug = debug
         self.explicit_url_map = {}
         self.parameterized_url_map = {}
-        # Currently opened connections
-        self.conns = {}
         # Statistics
         self.processed_connections = 0
+
+    async def __aenter__(self):
+        await self.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._server.close()
+        await self._server.wait_closed()
+
+    async def start(self):
+        self._server = await uasyncio.start_server(self._handler, self.host, self.port, backlog=self.backlog)
 
     def _find_url_handler(self, req):
         """Helper to find URL handler.
@@ -429,7 +445,7 @@ class webserver:
             req = request(reader)
             resp = response(writer)
             # Read HTTP Request with timeout
-            await asyncio.wait_for(self._handle_request(req, resp),
+            await uasyncio.wait_for(self._handle_request(req, resp),
                                    self.request_timeout)
 
             # OPTIONS method is handled automatically
@@ -454,7 +470,7 @@ class webserver:
             else:
                 await req.handler(req, resp)
             # Done here
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (uasyncio.CancelledError, uasyncio.TimeoutError):
             pass
         except OSError as e:
             # Do not send response for connection related errors - too late :)
@@ -463,16 +479,15 @@ class webserver:
                 try:
                     await resp.error(500)
                 except Exception as e:
-                    log.exc(e, "")
+                    log_error(e)
         except HTTPException as e:
             try:
                 await resp.error(e.code)
             except Exception as e:
-                log.exc(e)
+                log_error(e)
         except Exception as e:
             # Unhandled expection in user's method
-            log.error(req.path.decode())
-            log.exc(e, "")
+            log_error(e)
             try:
                 await resp.error(500)
                 # Send exception info if desired
@@ -482,12 +497,6 @@ class webserver:
                 pass
         finally:
             await writer.aclose()
-            # Max concurrency support -
-            # if queue is full schedule resume of TCP server task
-            if len(self.conns) == self.max_concurrency:
-                self.loop.call_soon(self._server_coro)
-            # Delete connection, using socket as a key
-            del self.conns[id(writer.s)]
 
     def add_route(self, url, f, **kwargs):
         """Add URL to function mapping.
@@ -603,57 +612,27 @@ class webserver:
             return f
         return _resource
 
-    async def _tcp_server(self, host, port, backlog):
-        """TCP Server implementation.
-        Opens socket for accepting connection and
-        creates task for every new accepted connection
-        """
-        addr = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)[0][-1]
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.setblocking(False)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(addr)
-        sock.listen(backlog)
-        try:
-            while True:
-                yield asyncio.IORead(sock)
-                csock, caddr = sock.accept()
-                csock.setblocking(False)
-                # Start handler / keep it in the map - to be able to
-                # shutdown gracefully - by close all connections
-                self.processed_connections += 1
-                hid = id(csock)
-                handler = self._handler(asyncio.StreamReader(csock),
-                                        asyncio.StreamWriter(csock, {}))
-                self.conns[hid] = handler
-                self.loop.create_task(handler)
-                # In case of max concurrency reached - temporary pause server:
-                # 1. backlog must be greater than max_concurrency, otherwise
-                #    client will got "Connection Reset"
-                # 2. Server task will be resumed whenever one active connection finished
-                if len(self.conns) == self.max_concurrency:
-                    # Pause
-                    yield False
-        except asyncio.CancelledError:
-            return
-        finally:
-            sock.close()
-
     def run(self, host="127.0.0.1", port=8081, loop_forever=True):
-        """Run Web Server. By default it runs forever.
+        """[DEPRECATED] In favour of native uasyncio this method is deprecated.
+        Use new, async version - start() instead.
+        NOTE: shutdown() is not supported when server started with run()
+
+        Run Web Server. By default it runs forever.
 
         Keyword arguments:
             host - host to listen on. By default - localhost (127.0.0.1)
             port - port to listen on. By default - 8081
-            loop_forever - run loo.loop_forever(), otherwise caller must run it by itself.
+            loop_forever - run uasyncio.loop_forever(), otherwise caller must run it by theirselves.
         """
-        self._server_coro = self._tcp_server(host, port, self.backlog)
-        self.loop.create_task(self._server_coro)
+        self._server = None
+        uasyncio.create_task(
+            uasyncio.start_server(self._handler, host, port)
+        )
         if loop_forever:
-            self.loop.run_forever()
+            uasyncio.get_event_loop().run_forever()
 
     def shutdown(self):
         """Gracefully shutdown Web Server"""
-        asyncio.cancel(self._server_coro)
-        for hid, coro in self.conns.items():
-            asyncio.cancel(coro)
+        # TODO: maybe close all connections as well? Isn't it done automatically?
+        if self._server is not None:
+            self._server.close()
